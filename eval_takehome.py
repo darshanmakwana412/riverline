@@ -21,6 +21,7 @@ import pickle
 import re
 import sys
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -77,6 +78,10 @@ PROGRESSION = [
 ]
 PROG_SET = set(PROGRESSION)
 EXIT = {"escalated", "dormant"}
+
+QUIET_START_HOUR = 19
+QUIET_END_HOUR = 8
+MIN_SPACING_SEC = 4 * 3600
 
 _HAPPY_PATH = [
     ("new", "message_received"),
@@ -150,6 +155,7 @@ class AgentEvaluator:
         violations += self._check_actions(function_calls, transitions)
         violations += self._check_post_exit_messages(messages, transitions)
         violations += self._check_all_classified(messages, bot_cls)
+        violations += self._check_timing(messages, transitions)
 
         summary = Counter(v["rule"].split("_", 1)[0] for v in violations)
         total_turns = max(1, conversation.get("metadata", {}).get("total_turns", len(messages)))
@@ -296,6 +302,56 @@ class AgentEvaluator:
                     "severity": 1.0,
                     "explanation": f"bot message at turn {m['turn']} after conversation entered exit state at turn {exit_turn}",
                 })
+        return out
+
+    def _check_timing(self, messages, transitions):
+        out = []
+        exit_turn = None
+        for tr in sorted(transitions, key=lambda t: t["turn"]):
+            if tr["to_state"] in EXIT and tr["from_state"] not in EXIT:
+                exit_turn = tr["turn"]
+                break
+
+        ordered = sorted(
+            [m for m in messages if m.get("timestamp")],
+            key=lambda m: (m["turn"], 0 if m["role"] == "borrower" else 1),
+        )
+        last_bot_ts = None
+        last_borrower_ts = None
+        prev_msg = None
+        for m in ordered:
+            if exit_turn is not None and m["turn"] > exit_turn:
+                break
+            ts = datetime.fromisoformat(m["timestamp"])
+            if m["role"] == "bot":
+                in_quiet = ts.hour >= QUIET_START_HOUR or ts.hour < QUIET_END_HOUR
+                prev_in_quiet = False
+                if prev_msg and prev_msg["role"] == "borrower":
+                    pts = datetime.fromisoformat(prev_msg["timestamp"])
+                    prev_in_quiet = pts.hour >= QUIET_START_HOUR or pts.hour < QUIET_END_HOUR
+                if in_quiet and not prev_in_quiet:
+                    out.append({
+                        "turn": int(m["turn"]),
+                        "rule": "T1_quiet_hours_outbound",
+                        "severity": 0.8,
+                        "explanation": f"outbound bot message at {ts.isoformat()} falls in quiet hours "
+                                       f"(19:00–08:00 IST) without a borrower message initiating contact",
+                    })
+                if last_bot_ts is not None and (last_borrower_ts is None or last_borrower_ts <= last_bot_ts):
+                    gap = (ts - last_bot_ts).total_seconds()
+                    if gap < MIN_SPACING_SEC:
+                        sev = round(min(0.8, max(0.5, 0.5 + 0.3 * (1 - gap / MIN_SPACING_SEC))), 3)
+                        out.append({
+                            "turn": int(m["turn"]),
+                            "rule": "T2_follow_up_too_fast",
+                            "severity": sev,
+                            "explanation": f"bot follow-up {gap/60:.1f} min after previous bot message "
+                                           f"with no borrower reply in between (min 240 min required)",
+                        })
+                last_bot_ts = ts
+            else:
+                last_borrower_ts = ts
+            prev_msg = m
         return out
 
     def _check_all_classified(self, messages, bot_cls):

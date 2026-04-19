@@ -13,3 +13,6 @@ All docs of the progress and things done so far are stored in ./docs/agents/hand
 ## Progress
 
 1. We have trained a borrower intent classifier that works reasonably well and with good accuracy @docs/approach.md
+2. I have also added the logic and validation check for state transitions and invalidations
+@docs/fsm_evaluator.md
+more docs are avl under @/docs/agents/handoff
