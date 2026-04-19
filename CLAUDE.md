@@ -9,3 +9,7 @@ ANTHROPIC_API_KEY=...
 ## Docs
 
 All docs of the progress and things done so far are stored in ./docs/agents/handoff/*
+
+## Progress
+
+1. We have trained a borrower intent classifier that works reasonably well and with good accuracy @docs/approach.md
