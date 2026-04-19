@@ -6,12 +6,21 @@ AgentEvaluator. Self-contained: loads a pre-trained borrower-intent classifier
 from scripts/classifier_model.pkl (trained by scripts/train_classifier.py).
 Conversation-level 70/30 split used for training; held-out conversation ids
 are stored in scripts/eval_split.json to prevent leakage in downstream work.
+
+Checks performed per conversation:
+  Q2  classifier vs. bot classification disagreement
+  I1  state transition in spec matrix (§3, Table 1) — incl. backward-exception
+  I2  exit states final (escalated/dormant) and no bot messages after entry
+  I3  state_transitions chain coherence (one state at a time)
+  I4  function_calls must happen during the correct transition
+  I5  every borrower message has a classification
 """
 
 import json
 import pickle
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -61,9 +70,43 @@ class HandFeatures(BaseEstimator, TransformerMixin):
 MODEL_PATH = Path(__file__).parent / "scripts" / "classifier_model.pkl"
 
 
+PROGRESSION = [
+    "new", "message_received", "verification", "intent_asked",
+    "settlement_explained", "amount_pending", "amount_sent",
+    "date_amount_asked", "payment_confirmed",
+]
+PROG_SET = set(PROGRESSION)
+EXIT = {"escalated", "dormant"}
+
+_HAPPY_PATH = [
+    ("new", "message_received"),
+    ("message_received", "verification"),
+    ("verification", "intent_asked"),
+    ("intent_asked", "settlement_explained"),
+    ("settlement_explained", "amount_pending"),
+    ("amount_pending", "amount_sent"),
+    ("amount_sent", "date_amount_asked"),
+    ("date_amount_asked", "payment_confirmed"),
+]
+ALLOWED_EDGES = set(_HAPPY_PATH)
+for _s in PROGRESSION:
+    ALLOWED_EDGES |= {(_s, "escalated"), (_s, "dormant"), (_s, "payment_confirmed")}
+ALLOWED_EDGES.discard(("payment_confirmed", "payment_confirmed"))
+
+BACKWARD_EXCEPTIONS = {
+    ("settlement_explained", "intent_asked"),
+    ("amount_pending", "intent_asked"),
+}
+
+ACTION_TRANSITIONS = {
+    "request_settlement_amount": ("settlement_explained", "amount_pending"),
+    "send_settlement_amount": ("amount_pending", "amount_sent"),
+    "confirm_payment": ("date_amount_asked", "payment_confirmed"),
+    "zcm_timeout": ("amount_pending", "escalated"),
+}
+
+
 def load_classifier(path: Path = MODEL_PATH):
-    """Load the pickled pipeline. HandFeatures was defined in __main__ at train
-    time; expose it there so pickle can resolve the symbol."""
     sys.modules["__main__"].HandFeatures = HandFeatures
     with open(path, "rb") as f:
         bundle = pickle.load(f)
@@ -71,8 +114,6 @@ def load_classifier(path: Path = MODEL_PATH):
 
 
 def classify_borrower_messages(pipeline, labels, messages):
-    """Return list of (turn, text, predicted_class, confidence) for every
-    borrower message. Uses predict_proba when available (CalibratedClassifierCV)."""
     borrower = [(m["turn"], m["text"]) for m in messages if m["role"] == "borrower" and m.get("text")]
     if not borrower:
         return []
@@ -93,40 +134,183 @@ class AgentEvaluator:
         self.pipeline, self.labels = load_classifier()
 
     def evaluate(self, conversation: dict) -> dict:
+        messages = conversation.get("messages", [])
+        bot_cls_list = conversation.get("bot_classifications", [])
+        bot_cls = {c["turn"]: c for c in bot_cls_list}
+        transitions = conversation.get("state_transitions", [])
+        function_calls = conversation.get("function_calls", [])
+
+        preds = classify_borrower_messages(self.pipeline, self.labels, messages)
+        preds_by_turn = {t: (p, c) for t, _, p, c in preds}
+
         violations = []
-        bot_cls = {c["turn"]: c for c in conversation.get("bot_classifications", [])}
-        preds = classify_borrower_messages(self.pipeline, self.labels, conversation.get("messages", []))
+        violations += self._check_q2(preds, bot_cls)
+        violations += self._check_transitions(transitions, preds_by_turn, bot_cls)
+        violations += self._check_chain_coherence(transitions)
+        violations += self._check_actions(function_calls, transitions)
+        violations += self._check_post_exit_messages(messages, transitions)
+        violations += self._check_all_classified(messages, bot_cls)
 
-        disagreements = 0
-        total_classified = 0
-        for turn, text, pred_cls, conf in preds:
-            bot = bot_cls.get(turn)
-            if not bot:
-                continue
-            total_classified += 1
-            if bot["classification"] != pred_cls:
-                disagreements += 1
-                severity = min(1.0, 0.3 + 0.7 * conf)
-                if pred_cls in ("hardship", "refuses", "disputes") and bot["classification"] == "unclear":
-                    severity = max(severity, 0.8)
-                violations.append({
-                    "turn": int(turn),
-                    "rule": "Q2_accurate_classification",
-                    "severity": round(severity, 3),
-                    "explanation": f"bot labeled '{bot['classification']}' (conf={bot.get('confidence')}) "
-                                   f"but classifier predicts '{pred_cls}' (conf={conf:.2f}) for: {text!r}",
-                })
-
-        disagreement_rate = disagreements / total_classified if total_classified else 0.0
-        avg_sev = sum(v["severity"] for v in violations) / len(violations) if violations else 0.0
-        quality_score = max(0.0, 1.0 - disagreement_rate)
-        risk_score = min(1.0, disagreement_rate * 0.5 + avg_sev * 0.5)
+        summary = Counter(v["rule"].split("_", 1)[0] for v in violations)
+        total_turns = max(1, conversation.get("metadata", {}).get("total_turns", len(messages)))
+        weighted = sum(v["severity"] for v in violations)
+        quality_score = max(0.0, 1.0 - weighted / total_turns)
+        avg_sev = weighted / len(violations) if violations else 0.0
+        risk_score = min(1.0, 0.5 * (len(violations) / total_turns) + 0.5 * avg_sev)
 
         return {
             "quality_score": round(quality_score, 4),
             "risk_score": round(risk_score, 4),
             "violations": violations,
+            "summary": dict(summary),
         }
+
+    def _check_q2(self, preds, bot_cls):
+        out = []
+        for turn, text, pred_cls, conf in preds:
+            bot = bot_cls.get(turn)
+            if not bot or bot["classification"] == pred_cls:
+                continue
+            severity = min(1.0, 0.3 + 0.7 * conf)
+            if pred_cls in ("hardship", "refuses", "disputes") and bot["classification"] == "unclear":
+                severity = max(severity, 0.8)
+            out.append({
+                "turn": int(turn),
+                "rule": "Q2_accurate_classification",
+                "severity": round(severity, 3),
+                "explanation": f"bot labeled '{bot['classification']}' (conf={bot.get('confidence')}) "
+                               f"but classifier predicts '{pred_cls}' (conf={conf:.2f}) for: {text!r}",
+            })
+        return out
+
+    def _check_transitions(self, transitions, preds_by_turn, bot_cls):
+        out = []
+        for tr in transitions:
+            frm, to, turn = tr["from_state"], tr["to_state"], tr["turn"]
+            if frm == to:
+                continue
+            if frm in EXIT:
+                out.append({
+                    "turn": int(turn),
+                    "rule": "I2_exit_state_not_final",
+                    "severity": 1.0,
+                    "explanation": f"transition out of exit state '{frm}' → '{to}' (reason={tr.get('reason')!r})",
+                })
+                continue
+            if (frm, to) in ALLOWED_EDGES:
+                continue
+            if (frm, to) in BACKWARD_EXCEPTIONS:
+                pred = preds_by_turn.get(turn) or preds_by_turn.get(turn - 1)
+                bot = bot_cls.get(turn) or bot_cls.get(turn - 1)
+                intent_ok = pred and pred[0] == "unclear"
+                conf_ok = bot and bot.get("confidence") == "low"
+                if intent_ok and conf_ok:
+                    continue
+                out.append({
+                    "turn": int(turn),
+                    "rule": "I1_backward_exception_unmet",
+                    "severity": 0.9,
+                    "explanation": f"backward '{frm}' → '{to}' requires borrower intent=unclear+confidence=low; "
+                                   f"got pred={pred}, bot={bot and (bot['classification'], bot.get('confidence'))}",
+                })
+                continue
+            if to in PROG_SET and frm in PROG_SET and PROGRESSION.index(to) < PROGRESSION.index(frm):
+                sev, rule = 0.9, "I1_backward_transition"
+            elif to in PROG_SET and frm in PROG_SET and PROGRESSION.index(to) > PROGRESSION.index(frm) + 1:
+                sev, rule = 0.8, "I1_skip_forward"
+            else:
+                sev, rule = 0.8, "I1_invalid_transition"
+            out.append({
+                "turn": int(turn),
+                "rule": rule,
+                "severity": sev,
+                "explanation": f"'{frm}' → '{to}' not in spec matrix (reason={tr.get('reason')!r})",
+            })
+        return out
+
+    def _check_chain_coherence(self, transitions):
+        out = []
+        if not transitions:
+            return out
+        ordered = sorted(transitions, key=lambda t: (t["turn"], 0))
+        if ordered[0]["from_state"] != "new":
+            out.append({
+                "turn": int(ordered[0]["turn"]),
+                "rule": "I3_chain_does_not_start_at_new",
+                "severity": 0.9,
+                "explanation": f"first transition starts at '{ordered[0]['from_state']}', expected 'new'",
+            })
+        for prev, cur in zip(ordered, ordered[1:]):
+            if prev["to_state"] != cur["from_state"]:
+                out.append({
+                    "turn": int(cur["turn"]),
+                    "rule": "I3_state_discontinuity",
+                    "severity": 0.9,
+                    "explanation": f"previous to_state='{prev['to_state']}' but next from_state='{cur['from_state']}'",
+                })
+        return out
+
+    def _check_actions(self, function_calls, transitions):
+        out = []
+        trans_by_turn = {}
+        for tr in transitions:
+            trans_by_turn.setdefault(tr["turn"], []).append((tr["from_state"], tr["to_state"]))
+        for fc in function_calls:
+            fn, turn = fc["function"], fc["turn"]
+            edges = trans_by_turn.get(turn, [])
+            if fn == "escalate":
+                if not any(to == "escalated" for _, to in edges):
+                    out.append({
+                        "turn": int(turn),
+                        "rule": "I4_action_state_mismatch",
+                        "severity": 0.9,
+                        "explanation": f"function 'escalate' did not produce a transition to 'escalated' at turn {turn}",
+                    })
+                continue
+            expected = ACTION_TRANSITIONS.get(fn)
+            if expected is None:
+                continue
+            if expected not in edges:
+                out.append({
+                    "turn": int(turn),
+                    "rule": "I4_action_state_mismatch",
+                    "severity": 0.9,
+                    "explanation": f"function '{fn}' requires transition {expected} at turn {turn}; got {edges or 'none'}",
+                })
+        return out
+
+    def _check_post_exit_messages(self, messages, transitions):
+        out = []
+        exit_turn = None
+        for tr in sorted(transitions, key=lambda t: t["turn"]):
+            if tr["to_state"] in EXIT and tr["from_state"] not in EXIT:
+                exit_turn = tr["turn"]
+                break
+        if exit_turn is None:
+            return out
+        for m in messages:
+            if m["role"] == "bot" and m["turn"] > exit_turn:
+                out.append({
+                    "turn": int(m["turn"]),
+                    "rule": "I2_message_after_exit",
+                    "severity": 1.0,
+                    "explanation": f"bot message at turn {m['turn']} after conversation entered exit state at turn {exit_turn}",
+                })
+        return out
+
+    def _check_all_classified(self, messages, bot_cls):
+        out = []
+        for m in messages:
+            if m["role"] != "borrower" or not m.get("text"):
+                continue
+            if m["turn"] not in bot_cls:
+                out.append({
+                    "turn": int(m["turn"]),
+                    "rule": "I5_missing_classification",
+                    "severity": 0.5,
+                    "explanation": f"borrower message at turn {m['turn']} has no bot_classifications entry",
+                })
+        return out
 
 
 def main():
@@ -149,9 +333,12 @@ def main():
         print(f"No split file; evaluating first {len(conversations)} conversations.")
 
     results = []
+    rule_totals = Counter()
     for conv in conversations:
         r = evaluator.evaluate(conv)
         results.append((conv["conversation_id"], r))
+        for rule, n in r["summary"].items():
+            rule_totals[rule] += n
 
     total_v = sum(len(r[1]["violations"]) for r in results)
     avg_q = sum(r[1]["quality_score"] for r in results) / len(results)
@@ -160,8 +347,10 @@ def main():
     print(f"  avg quality_score: {avg_q:.3f}")
     print(f"  avg risk_score:    {avg_r:.3f}")
     print(f"  total violations:  {total_v}")
+    print(f"  per-rule totals:   {dict(rule_totals)}")
     for cid, r in results[:5]:
-        print(f"  {cid}: q={r['quality_score']:.2f} risk={r['risk_score']:.2f} viols={len(r['violations'])}")
+        print(f"  {cid}: q={r['quality_score']:.2f} risk={r['risk_score']:.2f} "
+              f"viols={len(r['violations'])} summary={r['summary']}")
 
 
 if __name__ == "__main__":
