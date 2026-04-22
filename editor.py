@@ -69,7 +69,7 @@ HTML = r"""<!DOCTYPE html>
     --yellow: #914d08; --yellow-light: #f4eddc; --border: #e0e0e0;
     --sidebar-w: 240px; --fsm-w: 400px;
   }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; background: var(--bg); color: var(--text); display: flex; height: 100vh; overflow: hidden; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 15px; background: var(--bg); color: var(--text); display: flex; height: 100vh; overflow: hidden; }
 
   #sidebar { width: var(--sidebar-w); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; }
   #sidebar-header { padding: 12px; border-bottom: 1px solid var(--border); }
@@ -103,10 +103,10 @@ HTML = r"""<!DOCTYPE html>
   .msg-group.borrower { align-items: flex-end; }
 
   .msg-bubble-wrap { position: relative; max-width: 82%; }
-  .msg { padding: 7px 10px; border-radius: 10px; font-size: 12px; line-height: 1.5; }
+  .msg { padding: 7px 10px; border-radius: 10px; font-size: 14px; line-height: 1.5; }
   .msg-group.bot .msg { background: var(--gray-light); border-bottom-left-radius: 3px; }
   .msg-group.borrower .msg { background: var(--brand); color: white; border-bottom-right-radius: 3px; }
-  .msg-ts { font-size: 9px; color: var(--gray); margin-top: 2px; }
+  .msg-ts { font-size: 11px; color: var(--gray); margin-top: 2px; }
   .msg-group.borrower .msg-ts { color: var(--brand-light); text-align: right; }
   .msg-class { font-size: 9px; color: var(--blue); background: var(--blue-light); padding: 1px 5px; border-radius: 3px; margin-top: 3px; display: inline-block; }
 
@@ -305,7 +305,8 @@ function renderConv({conversation: conv, outcome, annotations}) {
     const isBot = msg.role === 'bot';
     const cls = !isBot && classMap[msg.turn];
     const fns = isBot ? (fnByTurn[msg.turn] || []) : [];
-    const ts = new Date(msg.timestamp).toLocaleString('en-IN', {hour:'2-digit',minute:'2-digit',day:'numeric',month:'short'});
+    const _d = new Date(msg.timestamp + (msg.timestamp.includes('Z') || msg.timestamp.includes('+') ? '' : 'Z'));
+    const ts = _d.toLocaleString('en-IN', {day:'numeric',month:'short',timeZone:'Asia/Kolkata'}) + ' · ' + _d.toLocaleString('en-IN', {hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false,timeZone:'Asia/Kolkata'}) + ' IST';
     const turnFps = !isBot ? (turnAnns[msg.turn] || []) : [];
 
     const group = document.createElement('div');
