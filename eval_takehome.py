@@ -387,7 +387,7 @@ def _tag_mention(text, start, end, role):
 
 
 def _clamp_sev(x, lo=0.3, hi=1.0):
-    return max(lo, min(hi, x))
+    return min(0.4, max(lo, min(hi, x)))
 
 
 def _check_amount_text(conversation):
