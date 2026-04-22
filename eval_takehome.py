@@ -18,7 +18,7 @@ AgentEvaluator checks:
   I5  — borrower message has no bot_classification entry
   A1  — POS > TOS (data integrity)
   A2  — settlement floor (settlement_offered) > POS
-  A3  — send_settlement_amount.amount outside [floor, TOS]
+  A3  — send_settlement_amount.amount outside [floor, TOS]; full_closure must equal TOS
   T0  — bot message has missing or unparseable timestamp (data quality)
   T1  — bot message during quiet hours 19:00–07:59 IST, unless borrower sent during quiet hours
   T2  — follow-up bot message < 4 hours after previous with no borrower reply in between
@@ -303,14 +303,20 @@ def _check_amounts(conversation):
         for call in conversation.get("function_calls", []):
             if call["function"] == "send_settlement_amount":
                 amt = call.get("params", {}).get("amount")
-                if amt is not None and (amt < floor_ or amt > tos):
-                    viols.append(_viol(call["turn"], "A3_amount_out_of_bounds", 0.9,
-                                       f"settlement amount={amt} not in [floor={floor_}, TOS={tos}]"))
+                call_type = call.get("params", {}).get("type", "")
+                if amt is not None:
+                    if call_type == "full_closure":
+                        if amt != tos:
+                            viols.append(_viol(call["turn"], "A3_full_closure_not_tos", 0.9,
+                                               f"full_closure amount={amt} must equal TOS={tos}"))
+                    elif amt < floor_ or amt > tos:
+                        viols.append(_viol(call["turn"], "A3_amount_out_of_bounds", 0.9,
+                                           f"settlement amount={amt} not in [floor={floor_}, TOS={tos}]"))
     return viols
 
 
 AMOUNT_RE = re.compile(
-    r"(?P<cur>₹|rs\.?|inr|rupees?)\s*(?P<num1>\d[\d,]*(?:\.\d+)?)\s*(?P<unit1>lakh|lakhs|lac|crore|cr|k|thousand)?"
+    r"(?P<cur>₹|rs\.?|inr|rupees?)\s*(?P<num1>\d[\d,]*(?:\.\d+)?)\s*(?P<unit1>lakh|lakhs|lac|crore|cr|k\b|thousand)?"
     r"|(?P<num2>\d+(?:\.\d+)?)\s*(?P<unit2>lakh|lakhs|lac|crore|cr)\b",
     re.IGNORECASE,
 )
@@ -320,7 +326,8 @@ UNIT_MULT = {"lakh": 100000, "lakhs": 100000, "lac": 100000,
 
 CLOSURE_KW = re.compile(
     r"\b(full closure|full payment|full amount|close the account|close your account|"
-    r"clear everything|foreclos\w*|pura payment|poora payment|entire amount|total amount)\b",
+    r"clear everything|foreclos\w*|pura payment|poora payment|entire amount|total amount|"
+    r"account band karna|deke account band|band karne ke liye)\b",
     re.I,
 )
 SETTLEMENT_KW = re.compile(
@@ -401,11 +408,16 @@ def _check_amount_text(conversation):
                              "tag": tag, "text": text, "span": (s, e)})
 
     if tos is not None:
+        seen_closure_viol = set()
         for mn in mentions:
             if mn["role"] != "bot" or mn["tag"] != "closure":
                 continue
             if mn["amount"] == tos:
                 continue
+            key = (mn["amount"], tos)
+            if key in seen_closure_viol:
+                continue
+            seen_closure_viol.add(key)
             rel = abs(mn["amount"] - tos) / tos
             sev = _clamp_sev(0.3 + 0.7 * rel)
             viols.append(_viol(mn["turn"], "A4_closure_not_tos", sev,
