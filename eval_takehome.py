@@ -19,8 +19,10 @@ AgentEvaluator checks:
   A1  — POS > TOS (data integrity)
   A2  — settlement floor (settlement_offered) > POS
   A3  — send_settlement_amount.amount outside [floor, TOS]
-  T1  — bot message during quiet hours 19:00–07:59 IST (non-reply)
+  T0  — bot message has missing or unparseable timestamp (data quality)
+  T1  — bot message during quiet hours 19:00–07:59 IST, unless borrower sent during quiet hours
   T2  — follow-up bot message < 4 hours after previous with no borrower reply in between
+  T3  — dormant triggered before 7 days of silence (early), or bot messaged after 7 days without going dormant (missed)
   C3  — bot messaged after borrower sent DNC request
   C5  — bot message contains threatening language
 
@@ -31,6 +33,8 @@ Assumptions:
     classification, not our classifier's prediction
   - metadata.settlement_offered is treated as the settlement floor (minimum company accepts)
   - Timestamps are naive UTC; converted to IST (+5:30) for timing checks
+  - T1 quiet-hour exception applies only when the borrower's message itself was sent during quiet hours
+  - Messages without timestamps inherit the last known timestamp (forward-fill by turn order); if no prior timestamp exists the message is skipped for timing checks only
   - Self-transitions are skipped universally
 """
 
@@ -305,27 +309,51 @@ def _check_amounts(conversation):
     return viols
 
 
+def _parse_ts(ts_str):
+    if not ts_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts_str)
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+    except ValueError:
+        return None
+
+
 def _check_timing(messages):
     viols = []
-    sorted_msgs = sorted(messages, key=lambda m: m.get("timestamp", ""))
+    last_known_dt = None
+    resolved = []
+    for m in sorted(messages, key=lambda m: m["turn"]):
+        dt = _parse_ts(m.get("timestamp"))
+        if dt is None:
+            if m["role"] == "bot":
+                viols.append(_viol(m["turn"], "T0_missing_timestamp", 0.4,
+                                   f"bot message at turn {m['turn']} has no parseable timestamp"))
+            dt = last_known_dt
+        else:
+            last_known_dt = dt
+        resolved.append((dt, m))
+
     last_bot_ts = None
     last_was_borrower = False
+    last_borrower_in_quiet = False
 
-    for m in sorted_msgs:
-        ts_str = m.get("timestamp")
-        if not ts_str:
+    for dt, m in resolved:
+        if dt is None:
+            if m["role"] == "bot":
+                last_was_borrower = False
+                last_borrower_in_quiet = False
+                last_bot_ts = None
+            else:
+                last_was_borrower = True
+                last_borrower_in_quiet = False
             continue
-        try:
-            dt = datetime.fromisoformat(ts_str)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            ts_ist = dt.astimezone(IST)
-        except ValueError:
-            continue
+
+        ts_ist = dt.astimezone(IST)
+        in_quiet = ts_ist.hour >= 19 or ts_ist.hour < 8
 
         if m["role"] == "bot":
-            hour = ts_ist.hour
-            if not last_was_borrower and (hour >= 19 or hour < 8):
+            if in_quiet and not (last_was_borrower and last_borrower_in_quiet):
                 viols.append(_viol(m["turn"], "T1_quiet_hours", 0.7,
                                    f"bot message at {ts_ist.strftime('%H:%M')} IST (quiet 19:00–08:00)"))
             if last_bot_ts is not None and not last_was_borrower:
@@ -335,8 +363,57 @@ def _check_timing(messages):
                                        f"bot re-messaged after {gap:.1f}h (min 4h required)"))
             last_bot_ts = dt
             last_was_borrower = False
+            last_borrower_in_quiet = False
         else:
             last_was_borrower = True
+            last_borrower_in_quiet = in_quiet
+
+    return viols
+
+
+def _check_dormancy(messages, transitions):
+    viols = []
+    first_dormant = next((t["turn"] for t in transitions if t["to_state"] == "dormant"), None)
+    sorted_msgs = sorted(messages, key=lambda m: m["turn"])
+
+    def _borrower_dt_before(turn):
+        candidates = [
+            (m["turn"], _parse_ts(m.get("timestamp")))
+            for m in sorted_msgs
+            if m["role"] == "borrower" and m["turn"] < turn
+        ]
+        candidates = [(t, dt) for t, dt in candidates if dt]
+        return max(candidates, key=lambda x: x[0])[1] if candidates else None
+
+    for trans in [t for t in transitions if t["to_state"] == "dormant"]:
+        dormant_turn = trans["turn"]
+        dormant_dt = next(
+            (_parse_ts(m.get("timestamp")) for m in reversed(sorted_msgs)
+             if m["turn"] <= dormant_turn and _parse_ts(m.get("timestamp"))),
+            None,
+        )
+        last_borrower_dt = _borrower_dt_before(dormant_turn)
+        if dormant_dt and last_borrower_dt:
+            gap_days = (dormant_dt - last_borrower_dt).total_seconds() / 86400
+            if gap_days < 7:
+                viols.append(_viol(dormant_turn, "T3_early_dormancy", 0.7,
+                                   f"dormant triggered after only {gap_days:.1f} days of silence (need 7)"))
+
+    last_borrower_dt = None
+    gap_flagged = False
+    for m in sorted_msgs:
+        dt = _parse_ts(m.get("timestamp"))
+        if not dt:
+            continue
+        if m["role"] == "borrower":
+            last_borrower_dt = dt
+            gap_flagged = False
+        elif m["role"] == "bot" and last_borrower_dt and not gap_flagged:
+            gap_days = (dt - last_borrower_dt).total_seconds() / 86400
+            if gap_days >= 7 and (first_dormant is None or m["turn"] < first_dormant):
+                viols.append(_viol(m["turn"], "T3_missed_dormancy", 0.8,
+                                   f"bot messaged {gap_days:.1f} days after last borrower reply without dormant transition"))
+                gap_flagged = True
 
     return viols
 
@@ -396,6 +473,7 @@ class AgentEvaluator:
             + _check_i4(transitions, function_calls)
             + _check_amounts(conversation)
             + _check_timing(messages)
+            + _check_dormancy(messages, transitions)
             + _check_compliance(messages)
         )
 
