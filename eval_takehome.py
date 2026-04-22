@@ -309,6 +309,180 @@ def _check_amounts(conversation):
     return viols
 
 
+AMOUNT_RE = re.compile(
+    r"(?P<cur>₹|rs\.?|inr|rupees?)\s*(?P<num1>\d[\d,]*(?:\.\d+)?)\s*(?P<unit1>lakh|lakhs|lac|crore|cr|k|thousand)?"
+    r"|(?P<num2>\d+(?:\.\d+)?)\s*(?P<unit2>lakh|lakhs|lac|crore|cr)\b",
+    re.IGNORECASE,
+)
+UNIT_MULT = {"lakh": 100000, "lakhs": 100000, "lac": 100000,
+             "crore": 10000000, "cr": 10000000,
+             "k": 1000, "thousand": 1000}
+
+CLOSURE_KW = re.compile(
+    r"\b(full closure|full payment|full amount|close the account|close your account|"
+    r"clear everything|foreclos\w*|pura payment|poora payment|entire amount|total amount)\b",
+    re.I,
+)
+SETTLEMENT_KW = re.compile(
+    r"\b(settle|settlement|reduced|reduction|approved|offer|can offer|can give|"
+    r"discount|waiver|kam amount|kam karke)\b",
+    re.I,
+)
+OUTSTANDING_KW = re.compile(
+    r"\b(outstanding|pending|balance|overdue|you owe|dues|bakaya|bakaaya|currently owe)\b",
+    re.I,
+)
+COUNTER_KW = re.compile(
+    r"\b(can only pay|can pay|will pay|could pay|able to pay|manage|pay only|"
+    r"max(?:imum)?|de sakta|de sakti|kar sakta|kar sakti|only have|i have|give you)\b",
+    re.I,
+)
+BOT_AGREES_KW = re.compile(
+    r"\b(okay|ok|sure|works|done|deal|confirmed|alright|great|perfect|agreed|"
+    r"that works|will do|noted)\b",
+    re.I,
+)
+
+
+def _extract_amounts(text):
+    out = []
+    for m in AMOUNT_RE.finditer(text):
+        if m.group("num1"):
+            raw = m.group("num1").replace(",", "")
+            unit = (m.group("unit1") or "").lower()
+        else:
+            raw = m.group("num2").replace(",", "")
+            unit = (m.group("unit2") or "").lower()
+        try:
+            val = float(raw)
+        except ValueError:
+            continue
+        val *= UNIT_MULT.get(unit, 1)
+        amt = int(round(val))
+        if amt < 100:
+            continue
+        out.append((amt, m.start(), m.end()))
+    return out
+
+
+def _tag_mention(text, start, end, role):
+    lo, hi = max(0, start - 50), min(len(text), end + 50)
+    ctx = text[lo:hi]
+    if role == "borrower" and COUNTER_KW.search(ctx):
+        return "counter_offer"
+    if CLOSURE_KW.search(ctx):
+        return "closure"
+    if SETTLEMENT_KW.search(ctx):
+        return "settlement"
+    if OUTSTANDING_KW.search(ctx):
+        return "outstanding"
+    return "generic"
+
+
+def _clamp_sev(x, lo=0.3, hi=1.0):
+    return max(lo, min(hi, x))
+
+
+def _check_amount_text(conversation):
+    viols = []
+    meta = conversation.get("metadata", {})
+    pos, tos, floor_ = meta.get("pos"), meta.get("tos"), meta.get("settlement_offered")
+    messages = sorted(conversation.get("messages", []), key=lambda m: m["turn"])
+    fn_calls = conversation.get("function_calls", [])
+
+    rq_turns = sorted(c["turn"] for c in fn_calls if c["function"] == "request_settlement_amount")
+
+    mentions = []
+    for m in messages:
+        text = m.get("text") or ""
+        for amt, s, e in _extract_amounts(text):
+            tag = _tag_mention(text, s, e, m["role"])
+            mentions.append({"turn": m["turn"], "role": m["role"], "amount": amt,
+                             "tag": tag, "text": text, "span": (s, e)})
+
+    if tos is not None:
+        for mn in mentions:
+            if mn["role"] != "bot" or mn["tag"] != "closure":
+                continue
+            if mn["amount"] == tos:
+                continue
+            rel = abs(mn["amount"] - tos) / tos
+            sev = _clamp_sev(0.3 + 0.7 * rel)
+            viols.append(_viol(mn["turn"], "A4_closure_not_tos", sev,
+                               f"bot quoted closure amount={mn['amount']} at turn {mn['turn']} "
+                               f"but TOS={tos} (spec: closure=TOS)"))
+
+    if floor_ is not None and tos is not None:
+        for mn in mentions:
+            if mn["role"] != "bot" or mn["tag"] != "settlement":
+                continue
+            a = mn["amount"]
+            if floor_ <= a <= tos:
+                continue
+            if a < floor_:
+                rel = (floor_ - a) / max(floor_, 1)
+            else:
+                rel = (a - tos) / max(tos, 1)
+            sev = _clamp_sev(0.3 + 0.7 * rel)
+            viols.append(_viol(mn["turn"], "A3_text_amount_out_of_bounds", sev,
+                               f"bot quoted settlement={a} at turn {mn['turn']} "
+                               f"not in [floor={floor_}, TOS={tos}]"))
+
+    if floor_ is not None:
+        for i, mn in enumerate(mentions):
+            if mn["role"] != "borrower" or mn["tag"] != "counter_offer":
+                continue
+            if mn["amount"] >= floor_:
+                continue
+            for j in range(i + 1, len(mentions)):
+                nxt = mentions[j]
+                if nxt["role"] != "bot" or nxt["turn"] <= mn["turn"]:
+                    continue
+                if BOT_AGREES_KW.search(nxt["text"][:200]):
+                    escalated = any(c["function"] == "escalate" and c["turn"] >= mn["turn"]
+                                    for c in fn_calls)
+                    if escalated:
+                        break
+                    rel = (floor_ - mn["amount"]) / max(floor_, 1)
+                    sev = _clamp_sev(0.3 + 0.7 * rel)
+                    viols.append(_viol(nxt["turn"], "A4_accepts_below_floor", sev,
+                                       f"borrower offered {mn['amount']} < floor={floor_} at turn {mn['turn']}; "
+                                       f"bot agreed at turn {nxt['turn']} without escalation"))
+                    break
+                break
+
+    bot_settlement = [mn for mn in mentions if mn["role"] == "bot" and mn["tag"] == "settlement"]
+    prev_amt = None
+    prev_turn = None
+    for mn in bot_settlement:
+        if prev_amt is None:
+            prev_amt, prev_turn = mn["amount"], mn["turn"]
+            continue
+        reset = any(prev_turn < rt <= mn["turn"] for rt in rq_turns)
+        if mn["amount"] != prev_amt and not reset:
+            rel = abs(mn["amount"] - prev_amt) / max(prev_amt, 1)
+            sev = _clamp_sev(0.3 + 0.7 * rel)
+            viols.append(_viol(mn["turn"], "A5_settlement_inconsistent", sev,
+                               f"bot settlement amount changed {prev_amt}→{mn['amount']} "
+                               f"(turn {prev_turn}→{mn['turn']}) without new ZCM request"))
+        prev_amt, prev_turn = mn["amount"], mn["turn"]
+
+    confirms = [c for c in fn_calls if c["function"] == "confirm_payment"]
+    if confirms and bot_settlement:
+        last_quoted = bot_settlement[-1]["amount"]
+        for c in confirms:
+            amt = c.get("params", {}).get("settlement_amount")
+            if amt is None or amt == last_quoted:
+                continue
+            rel = abs(amt - last_quoted) / max(last_quoted, 1)
+            sev = _clamp_sev(0.3 + 0.7 * rel)
+            viols.append(_viol(c["turn"], "A5_confirm_mismatch", sev,
+                               f"confirm_payment.amount={amt} but last bot-quoted "
+                               f"settlement={last_quoted}"))
+
+    return viols
+
+
 def _parse_ts(ts_str):
     if not ts_str:
         return None
@@ -472,6 +646,7 @@ class AgentEvaluator:
             + _check_i2(transitions, messages)
             + _check_i4(transitions, function_calls)
             + _check_amounts(conversation)
+            + _check_amount_text(conversation)
             + _check_timing(messages)
             + _check_dormancy(messages, transitions)
             + _check_compliance(messages)
