@@ -104,8 +104,10 @@ ACTION_TRANSITIONS = {
     "request_settlement_amount": ("settlement_explained", "amount_pending"),
     "send_settlement_amount": ("amount_pending", "amount_sent"),
     "confirm_payment": ("date_amount_asked", "payment_confirmed"),
-    "zcm_timeout": ("amount_pending", "escalated"),
 }
+
+WEEK_MONTH_RE = re.compile(r"\b(\d+)\s*(week|weeks|month|months|hafte|hafta|mahina|mahine)\b", re.I)
+REINTRO_RE = re.compile(r"\b(priya|riverline).*(here|from|again)\b", re.I)
 
 REQUIRED_ACTION_FOR_EDGE = {
     ("settlement_explained", "amount_pending"): "request_settlement_amount",
@@ -155,11 +157,13 @@ class AgentEvaluator:
         violations += self._check_q2(preds, bot_cls)
         violations += self._check_transitions(transitions, preds_by_turn, bot_cls)
         violations += self._check_chain_coherence(transitions)
-        violations += self._check_actions(function_calls, transitions)
+        violations += self._check_actions(function_calls, transitions, messages)
         violations += self._check_post_exit_messages(messages, transitions)
         violations += self._check_all_classified(messages, bot_cls)
         violations += self._check_timing(messages, transitions)
         violations += self._check_amounts(conversation, messages, transitions, function_calls)
+        violations += self._check_repetition(messages)
+        violations += self._check_verification_bypass(messages, transitions, preds_by_turn)
 
         summary = Counter(v["rule"].split("_", 1)[0] for v in violations)
         total_turns = max(1, conversation.get("metadata", {}).get("total_turns", len(messages)))
@@ -260,8 +264,18 @@ class AgentEvaluator:
                 })
         return out
 
-    def _check_actions(self, function_calls, transitions):
+    def _check_actions(self, function_calls, transitions, messages=None):
+        borrower_by_turn = {}
+        if messages:
+            for m in messages:
+                if m["role"] == "borrower":
+                    borrower_by_turn[m["turn"]] = m.get("text", "") or ""
         out = []
+        def _prior_borrower_text(turn):
+            for t in range(turn, max(-1, turn - 4), -1):
+                if t in borrower_by_turn:
+                    return borrower_by_turn[t]
+            return ""
         trans_by_turn = {}
         for tr in transitions:
             trans_by_turn.setdefault(tr["turn"], []).append((tr["from_state"], tr["to_state"]))
@@ -291,6 +305,18 @@ class AgentEvaluator:
                         "severity": 0.8,
                         "explanation": f"confirm_payment.payment_date={date_tok!r} not in allowed window vocabulary {sorted(ALLOWED_PAYMENT_DATE_TOKENS)}",
                     })
+                if date_tok == "within_7_days":
+                    m = WEEK_MONTH_RE.search(_prior_borrower_text(turn))
+                    if m:
+                        n, unit = int(m.group(1)), m.group(2).lower()
+                        days = n * 7 if unit.startswith(("week", "hafta", "hafte")) else n * 30
+                        if days > 7:
+                            out.append({
+                                "turn": int(turn),
+                                "rule": "I4_payment_date_semantic_mismatch",
+                                "severity": 0.7,
+                                "explanation": f"confirm_payment logged 'within_7_days' but borrower requested ~{days} days ({m.group(0)!r})",
+                            })
             if fn == "zcm_timeout":
                 restoring = params.get("restoring_to")
                 if restoring and restoring != "escalated":
@@ -311,19 +337,32 @@ class AgentEvaluator:
                     "explanation": f"function '{fn}' requires transition {expected} at turn {turn}; got {edges or 'none'}",
                 })
 
+        bot_text_by_turn = {}
+        if messages:
+            for m in messages:
+                if m["role"] == "bot":
+                    bot_text_by_turn[m["turn"]] = m.get("text", "") or ""
+
         for tr in transitions:
             edge = (tr["from_state"], tr["to_state"])
             required_fn = REQUIRED_ACTION_FOR_EDGE.get(edge)
             if not required_fn:
                 continue
             calls = calls_by_turn.get(tr["turn"], [])
-            if not any(c["function"] == required_fn for c in calls):
-                out.append({
-                    "turn": int(tr["turn"]),
-                    "rule": "I4_missing_required_action",
-                    "severity": 0.9,
-                    "explanation": f"transition {edge} requires function '{required_fn}' at turn {tr['turn']}; none recorded",
-                })
+            if any(c["function"] == required_fn for c in calls):
+                continue
+            rule, sev, note = "I4_missing_required_action", 0.9, ""
+            if required_fn == "send_settlement_amount":
+                txt = bot_text_by_turn.get(tr["turn"], "")
+                figs = [int(float(r.replace(",", "").rstrip("."))) for r in RUPEE_RE.findall(txt) if r]
+                if any(f >= 1000 for f in figs):
+                    rule, sev, note = "I4_missing_action_log_probable", 0.4, " (bot text quotes amount — likely a logging gap)"
+            out.append({
+                "turn": int(tr["turn"]),
+                "rule": rule,
+                "severity": sev,
+                "explanation": f"transition {edge} requires function '{required_fn}' at turn {tr['turn']}; none recorded" + note,
+            })
         return out
 
     def _check_post_exit_messages(self, messages, transitions):
@@ -335,14 +374,16 @@ class AgentEvaluator:
                 break
         if exit_turn is None:
             return out
-        for m in messages:
-            if m["role"] == "bot" and m["turn"] > exit_turn:
-                out.append({
-                    "turn": int(m["turn"]),
-                    "rule": "I2_message_after_exit",
-                    "severity": 1.0,
-                    "explanation": f"bot message at turn {m['turn']} after conversation entered exit state at turn {exit_turn}",
-                })
+        post = [m for m in messages if m["role"] == "bot" and m["turn"] > exit_turn]
+        for i, m in enumerate(post):
+            sev = 1.0 if i == 0 else round(1.0 / (1 + i), 3)
+            out.append({
+                "turn": int(m["turn"]),
+                "rule": "I2_message_after_exit" if i == 0 else "I2_message_after_exit_continued",
+                "severity": sev,
+                "explanation": f"bot message at turn {m['turn']} after conversation entered exit state at turn {exit_turn}"
+                               + (f" (continuation #{i})" if i else ""),
+            })
         return out
 
     def _check_timing(self, messages, transitions):
@@ -517,6 +558,53 @@ class AgentEvaluator:
                         "explanation": f"bot message quotes {plausible} but approved settlement amount is "
                                        f"{quoted} (first sent at turn {first_sent_turn})",
                     })
+        return out
+
+    def _check_repetition(self, messages):
+        import difflib
+        out = []
+        bot_msgs = [(m["turn"], (m.get("text") or "").strip().lower()) for m in messages if m["role"] == "bot" and m.get("text")]
+        run_start = None
+        run_len = 1
+        prev = None
+        for turn, text in bot_msgs:
+            if prev is not None and difflib.SequenceMatcher(None, prev[1], text).ratio() > 0.9:
+                run_len += 1
+                if run_start is None:
+                    run_start = prev[0]
+                if run_len >= 2:
+                    sev = round(min(1.0, 0.4 + 0.15 * (run_len - 1)), 3)
+                    out.append({
+                        "turn": int(turn),
+                        "rule": "Q5_repetition",
+                        "severity": sev,
+                        "explanation": f"bot message near-identical to previous bot turn (run length {run_len}, started turn {run_start})",
+                    })
+            else:
+                run_start = None
+                run_len = 1
+            prev = (turn, text)
+        return out
+
+    def _check_verification_bypass(self, messages, transitions, preds_by_turn):
+        out = []
+        borrower_by_turn = {m["turn"]: (m.get("text") or "") for m in messages if m["role"] == "borrower"}
+        dispute_re = re.compile(DISPUTE_WORDS, re.I)
+        for tr in transitions:
+            if tr["from_state"] != "verification" or tr["to_state"] != "intent_asked":
+                continue
+            turn = tr["turn"]
+            text = borrower_by_turn.get(turn) or borrower_by_turn.get(turn - 1) or ""
+            pred = preds_by_turn.get(turn) or preds_by_turn.get(turn - 1)
+            disputes = bool(dispute_re.search(text))
+            pred_bad = pred and pred[0] in ("disputes", "unclear", "refuses")
+            if disputes or pred_bad:
+                out.append({
+                    "turn": int(turn),
+                    "rule": "I4_verification_accepted_without_confirmation",
+                    "severity": 0.9,
+                    "explanation": f"verification→intent_asked at turn {turn} but borrower text={text!r} (pred={pred}) signals dispute/inability to confirm",
+                })
         return out
 
     def _check_all_classified(self, messages, bot_cls):
