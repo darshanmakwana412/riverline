@@ -249,10 +249,13 @@ def _check_i2(transitions, messages):
     return viols
 
 
+CONV_WIDE_ACTIONS = {"send_settlement_amount"}
+
 def _check_i4(transitions, function_calls):
     viols = []
     trans_by_turn = _index_by_turn(transitions)
     calls_by_turn = _index_by_turn(function_calls)
+    all_call_fns = {c["function"] for c in function_calls}
 
     action_edge_check = {
         "send_settlement_amount": lambda f, to: (f, to) == ("amount_pending", "amount_sent"),
@@ -279,8 +282,13 @@ def _check_i4(transitions, function_calls):
             if edge in REQUIRED_ACTION:
                 req = REQUIRED_ACTION[edge]
                 if req not in call_fns:
-                    viols.append(_viol(turn, "I4_required_action_missing", 0.9,
-                                       f"{edge[0]}→{edge[1]} at turn {turn} requires '{req}' (not found)"))
+                    if req in CONV_WIDE_ACTIONS and req in all_call_fns:
+                        viols.append(_viol(turn, "I4_required_action_wrong_turn", 0.6,
+                                           f"{edge[0]}→{edge[1]} at turn {turn} requires '{req}' "
+                                           f"(exists in conversation but not at this turn)"))
+                    else:
+                        viols.append(_viol(turn, "I4_required_action_missing", 0.9,
+                                           f"{edge[0]}→{edge[1]} at turn {turn} requires '{req}' (not found)"))
             if t["to_state"] == "escalated" and "escalate" not in call_fns and "zcm_timeout" not in call_fns:
                 viols.append(_viol(turn, "I4_escalation_missing_call", 0.9,
                                    f"→escalated at turn {turn} has no 'escalate' or 'zcm_timeout' call"))
@@ -630,18 +638,29 @@ class AgentEvaluator:
         self.pipeline, self.labels = load_classifier()
 
     def _check_q2(self, messages, bot_cls_map):
-        viols = []
+        import math
+        groups = defaultdict(list)
         for turn, text, pred_cls, conf in classify_borrower_messages(self.pipeline, self.labels, messages):
             bot = bot_cls_map.get(turn)
-            if not bot:
+            if not bot or bot["classification"] == pred_cls:
                 continue
-            if bot["classification"] != pred_cls:
-                sev = min(1.0, 0.3 + 0.7 * conf)
-                if pred_cls in ("hardship", "refuses", "disputes") and bot["classification"] == "unclear":
-                    sev = max(sev, 0.8)
-                viols.append(_viol(turn, "Q2_accurate_classification", sev,
-                                   f"bot='{bot['classification']}' (conf={bot.get('confidence')}) "
-                                   f"classifier='{pred_cls}' (conf={conf:.2f}): {text!r}"))
+            key = (text, bot["classification"], pred_cls)
+            groups[key].append((turn, conf, bot.get("confidence")))
+
+        viols = []
+        for (text, bot_cls, pred_cls), instances in groups.items():
+            first_turn = instances[0][0]
+            max_conf = max(c for _, c, _ in instances)
+            count = len(instances)
+            sev = min(1.0, 0.3 + 0.7 * max_conf)
+            if pred_cls in ("hardship", "refuses", "disputes") and bot_cls == "unclear":
+                sev = max(sev, 0.8)
+            if count > 1:
+                sev = min(1.0, sev * (1 + 0.1 * math.log(count)))
+            turns_str = f"turns {[t for t, _, _ in instances]}" if count > 1 else f"turn {first_turn}"
+            viols.append(_viol(first_turn, "Q2_accurate_classification", round(sev, 3),
+                               f"bot='{bot_cls}' classifier='{pred_cls}' (max_conf={max_conf:.2f}) "
+                               f"x{count} at {turns_str}: {text!r}"))
         return viols
 
     def evaluate(self, conversation: dict) -> dict:
