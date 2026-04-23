@@ -144,7 +144,11 @@ REQUIRED_ACTION = {
 IST = timezone(timedelta(hours=5, minutes=30))
 
 DNC_RE = re.compile(
-    r"\b(stop|do not contact|don'?t contact|leave me alone|block me|unsubscribe|opt.?out|do not call|don'?t call)\b",
+    r"\b(stop|do not contact|don'?t contact|leave me alone|block me|unsubscribe|opt.?out|do not call|don'?t call)\b"
+    r"|\b(phone|message|call|sms|contact)\s+(mat|band)\b"
+    r"|\b(band karo|band kar do|band kar dijiye|band kar)\b"
+    r"|\b(pareshaan mat|tang mat|tang karna band|dobara (phone|message|call) mat)\b"
+    r"|\bbaar baar\b.{0,40}\b(band|mat)\b",
     re.I,
 )
 THREAT_RE = re.compile(
@@ -612,21 +616,91 @@ def _check_dormancy(messages, transitions):
     return viols
 
 
+INTRO_RE = re.compile(
+    r"\b(this is priya|my name is priya|i'?m priya|calling from riverline|from riverline financial)\b",
+    re.I,
+)
+VERIFY_RE = re.compile(
+    r"\b(verify|verification|confirm your (identity|details|name|date)|"
+    r"date of birth|last 4 digits|pan card|aadhaar|aadhar|registered mobile)\b",
+    re.I,
+)
+
+
+def _normalize_bot_text(t):
+    t = re.sub(r"[\U0001F300-\U0001FAFF\U00002600-\U000027BF]", "", t)
+    t = re.sub(r"\W+", " ", t).strip().lower()
+    return t
+
+
+def _check_q5_repetition(messages):
+    viols = []
+    groups = defaultdict(list)
+    for m in sorted(messages, key=lambda m: m["turn"]):
+        if m["role"] != "bot" or not m.get("text"):
+            continue
+        norm = _normalize_bot_text(m["text"])
+        if len(norm) < 20:
+            continue
+        groups[norm].append(m["turn"])
+    for norm, turns in groups.items():
+        if len(turns) < 2:
+            continue
+        count = len(turns)
+        sev = min(0.9, 0.3 + 0.2 * (count - 1))
+        viols.append(_viol(turns[1], "Q5_repetition", sev,
+                           f"bot sent near-identical message {count}x at turns {turns}"))
+    return viols
+
+
+def _check_q4_context(messages, transitions):
+    viols = []
+    sorted_msgs = sorted(messages, key=lambda m: m["turn"])
+    intent_turn = next((t["turn"] for t in transitions
+                        if t["from_state"] == "verification" and t["to_state"] == "intent_asked"), None)
+
+    reintro_flagged = False
+    reverif_flagged = False
+    for m in sorted_msgs:
+        if m["role"] != "bot" or not m.get("text"):
+            continue
+        text = m["text"]
+        if not reintro_flagged and m["turn"] > 0 and INTRO_RE.search(text):
+            viols.append(_viol(m["turn"], "Q4_reintroduction", 0.7,
+                               f"bot re-introduced itself at turn {m['turn']} "
+                               f"(should only happen at turn 0)"))
+            reintro_flagged = True
+        if (not reverif_flagged and intent_turn is not None
+                and m["turn"] > intent_turn and VERIFY_RE.search(text)):
+            viols.append(_viol(m["turn"], "Q4_reverification", 0.7,
+                               f"bot re-asked verification at turn {m['turn']} "
+                               f"after verification→intent_asked completed at turn {intent_turn}"))
+            reverif_flagged = True
+    return viols
+
+
 def _check_compliance(messages):
     viols = []
     sorted_msgs = sorted(messages, key=lambda m: m["turn"])
     dnc_turn = None
+    post_dnc_bot_turns = []
 
     for m in sorted_msgs:
         if m["role"] == "borrower" and m.get("text") and DNC_RE.search(m["text"]):
             if dnc_turn is None:
                 dnc_turn = m["turn"]
         if dnc_turn is not None and m["role"] == "bot" and m["turn"] > dnc_turn:
-            viols.append(_viol(m["turn"], "C3_dnc_violation", 1.0,
-                               f"bot messaged at turn {m['turn']} after DNC at turn {dnc_turn}"))
+            post_dnc_bot_turns.append(m["turn"])
         if m["role"] == "bot" and m.get("text") and THREAT_RE.search(m["text"]):
             viols.append(_viol(m["turn"], "C5_threat_in_message", 0.9,
                                f"threatening language: {m['text'][:120]!r}"))
+
+    if post_dnc_bot_turns:
+        count = len(post_dnc_bot_turns)
+        sev = min(1.0, 0.7 + 0.1 * (count - 1))
+        viols.append(_viol(post_dnc_bot_turns[0], "C3_dnc_violation", sev,
+                           f"bot sent {count} message(s) after DNC at turn {dnc_turn} "
+                           f"(first offending turn {post_dnc_bot_turns[0]})"))
 
     return viols
 
@@ -681,6 +755,8 @@ class AgentEvaluator:
             + _check_timing(messages)
             + _check_dormancy(messages, transitions)
             + _check_compliance(messages)
+            + _check_q4_context(messages, transitions)
+            + _check_q5_repetition(messages)
         )
 
         total_turns = max(1, conversation.get("metadata", {}).get("total_turns", len(messages)))
