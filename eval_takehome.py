@@ -7,7 +7,6 @@
 # ]
 # ///
 """
-Riverline Evals Take-Home Assignment
 =====================================
 AgentEvaluator checks:
   Q2  — borrower intent misclassification (ML classifier vs bot label)
