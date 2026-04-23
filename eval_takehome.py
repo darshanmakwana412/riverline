@@ -386,8 +386,11 @@ def _extract_amounts(text):
 def _tag_mention(text, start, end, role):
     lo, hi = max(0, start - 50), min(len(text), end + 50)
     ctx = text[lo:hi]
+    pre_ctx = text[lo:start]
     if role == "borrower" and COUNTER_KW.search(ctx):
         return "counter_offer"
+    if SETTLEMENT_KW.search(pre_ctx):
+        return "settlement"
     if CLOSURE_KW.search(ctx):
         return "closure"
     if SETTLEMENT_KW.search(ctx):
@@ -397,8 +400,8 @@ def _tag_mention(text, start, end, role):
     return "generic"
 
 
-def _clamp_sev(x, lo=0.3, hi=1.0):
-    return min(0.4, max(lo, min(hi, x)))
+def _clamp_sev(x, lo=0.4, hi=1.0):
+    return max(lo, min(hi, x))
 
 
 def _check_amount_text(conversation):
@@ -586,7 +589,7 @@ def _check_dormancy(messages, transitions):
         dormant_turn = trans["turn"]
         dormant_dt = next(
             (_parse_ts(m.get("timestamp")) for m in reversed(sorted_msgs)
-             if m["turn"] <= dormant_turn and _parse_ts(m.get("timestamp"))),
+             if m["turn"] == dormant_turn and _parse_ts(m.get("timestamp"))),
             None,
         )
         last_borrower_dt = _borrower_dt_before(dormant_turn)
