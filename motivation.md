@@ -4,4 +4,4 @@ A few other things I'm genuinely excited about, not in any particular order:
 
 - I had a feel of what it looks like designign evaluation systems at scale, now I want to make them work in real life and go to production
 - I am very much passionate about technology and how we can integrate it into every aspects of our life, from claw agents answering emails to agents that improve the lives of people
-- Also we read somewhere we get unlimited tokens to burn, I have always been wanting to build things with 10 claude agents all running at the same time but the rate limits never made it possible, at riverline I see some hope :)
+- Also I read somewhere we get unlimited tokens to burn, I have always been wanting to build things with 10 claude agents all running at the same time but the rate limits never made it possible, at riverline I see some hope :)
