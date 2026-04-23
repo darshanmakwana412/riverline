@@ -1,5 +1,5 @@
 We are working on this problem assignment from riverline
-Detailed instructions on the problem can be found in the README.m @README.md and at the specification document @spec.tex for the whatsapp debt collection agent specs
+Detailed instructions on the problem can be found in the INFO.md @INFO.md and at the specification document @spec.tex for the whatsapp debt collection agent specs
 The domain brief @docs/domain.md contains domain level terminology for the debt collection domain
 The eval_takehome.py @eval_takehome.py script contains the evaluator designed so far
 The data dir is where all the data is stored @data
